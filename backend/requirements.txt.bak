@@ -1,0 +1,13 @@
+# --- Modelo: versiones exactas del entrenamiento ---
+tensorflow==2.21.0
+keras==3.12.0
+numpy==2.2.6
+opencv-python==5.0.0.*
+
+# --- Deteccion de ojos (modelo preentrenado) ---
+mediapipe
+
+# --- API ---
+fastapi
+uvicorn[standard]
+python-multipart

@@ -1,0 +1,166 @@
+"""Deteccion de la posicion de los ojos con YuNet (OpenCV).
+
+YuNet es un detector de rostros preentrenado que viene con OpenCV
+(cv2.FaceDetectorYN, licencia Apache 2.0). Ademas de la caja de la cara
+devuelve 5 puntos clave, entre ellos el centro de cada ojo, que es lo
+unico que necesitamos para recortar.
+
+Los pesos son el archivo models/face_detection_yunet_2023mar.onnx (228 KB),
+que vive en el repo. El backend sigue siendo autocontenido.
+
+Por que los centros y no el contorno del ojo:
+    Si la caja se calcula a partir de la forma del ojo, al cerrarse el
+    contorno se aplana y la caja encoge. O sea, la escala del recorte
+    cambiaria justo en funcion de lo que queremos medir, y eso es ruido
+    para la CNN. La distancia entre los dos ojos, en cambio, no cambia al
+    parpadear: solo depende de que tan cerca esta la cara de la camara.
+    Por eso el tamano del recorte se deriva de esa distancia.
+"""
+
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+RUTA_YUNET = Path(__file__).parent / "models" / "face_detection_yunet_2023mar.onnx"
+
+# Lado del recorte como fraccion de la distancia interocular.
+# Subelo si tus recortes salen demasiado pegados al ojo; bajalo si sale
+# demasiada cara alrededor. Comparalo siempre contra training/data/.
+FACTOR_RECORTE = 0.65
+
+# YuNet pierde precision cuando la cara ocupa demasiados pixeles: en una
+# foto de 2316px de ancho el mejor score cae a 0.6 y aparecen decenas de
+# falsos positivos, mientras que a 640px sube a 0.91. Por eso la deteccion
+# se hace sobre una copia reducida y las coordenadas se escalan de vuelta.
+# Los frames de webcam ya suelen venir en 640, asi que no se toca nada.
+ANCHO_DETECCION = 640
+
+# Orden de los 5 puntos clave que devuelve YuNet.
+_PUNTO_OJO_DERECHO = 0   # ojo derecho del sujeto (aparece a la izquierda del frame)
+_PUNTO_OJO_IZQUIERDO = 1
+
+
+@dataclass
+class Ojo:
+    """Un ojo localizado dentro del frame."""
+
+    lado: str            # "izquierdo" | "derecho", desde el punto de vista del conductor
+    x: int               # esquina superior izquierda de la caja, en pixeles del frame
+    y: int
+    w: int
+    h: int
+    recorte: np.ndarray  # sub-imagen BGR correspondiente a la caja
+
+
+class DetectorOjos:
+    """Envoltorio sobre YuNet que devuelve cajas y recortes de ojos.
+
+    El objeto de OpenCV guarda el tamano de entrada como estado interno y
+    no es seguro para uso concurrente. FastAPI ejecuta los endpoints
+    sincronos en un pool de hilos, asi que cada llamada se serializa.
+    """
+
+    def __init__(
+        self,
+        confianza: float = 0.6,
+        ruta_modelo: Path = RUTA_YUNET,
+    ) -> None:
+        if not Path(ruta_modelo).exists():
+            raise FileNotFoundError(
+                f"No se encontro el modelo YuNet en {ruta_modelo}. "
+                "Descargalo de https://github.com/opencv/opencv_zoo/raw/main/"
+                "models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+            )
+
+        self._detector = cv2.FaceDetectorYN.create(
+            model=str(ruta_modelo),
+            config="",
+            input_size=(320, 320),   # se reajusta en cada frame
+            score_threshold=confianza,
+            nms_threshold=0.3,
+            top_k=5000,
+        )
+        self._lock = threading.Lock()
+
+    def detectar(self, img_bgr: np.ndarray) -> list[Ojo]:
+        """Localiza los ojos en un frame BGR.
+
+        Devuelve una lista vacia si no se detecta ninguna cara (el conductor
+        giro la cabeza, hay poca luz, etc.). Eso no es un error.
+        """
+        alto, ancho = img_bgr.shape[:2]
+
+        # Reducir solo si hace falta. escala = pixeles del original por
+        # cada pixel de la imagen de deteccion.
+        if ancho > ANCHO_DETECCION:
+            escala = ancho / ANCHO_DETECCION
+            img_det = cv2.resize(
+                img_bgr, (ANCHO_DETECCION, int(round(alto / escala)))
+            )
+        else:
+            escala = 1.0
+            img_det = img_bgr
+
+        alto_det, ancho_det = img_det.shape[:2]
+
+        with self._lock:
+            # YuNet exige que se le declare el tamano exacto del frame.
+            self._detector.setInputSize((ancho_det, alto_det))
+            _, caras = self._detector.detect(img_det)
+
+        if caras is None or len(caras) == 0:
+            return []
+
+        # Si hay varias caras, nos quedamos con la de mayor puntuacion
+        # (la ultima columna). En un carro deberia haber una sola.
+        cara = max(caras, key=lambda c: c[-1])
+
+        # Columnas 4..13: los 5 puntos clave como pares (x, y).
+        # Se multiplican por la escala para volver al frame original.
+        puntos = cara[4:14].reshape(5, 2) * escala
+        ojo_der = puntos[_PUNTO_OJO_DERECHO]
+        ojo_izq = puntos[_PUNTO_OJO_IZQUIERDO]
+
+        distancia = float(np.linalg.norm(ojo_izq - ojo_der))
+        if distancia < 10:
+            # Cara demasiado pequena o deteccion degenerada.
+            return []
+
+        lado_recorte = distancia * FACTOR_RECORTE
+
+        ojos: list[Ojo] = []
+        for nombre, centro in (("derecho", ojo_der), ("izquierdo", ojo_izq)):
+            caja = self._caja_cuadrada(centro, lado_recorte, ancho, alto)
+            if caja is None:
+                continue
+            x, y, w, h = caja
+            ojos.append(
+                Ojo(lado=nombre, x=x, y=y, w=w, h=h, recorte=img_bgr[y:y + h, x:x + w].copy())
+            )
+
+        return ojos
+
+    def cerrar(self) -> None:
+        """Existe por simetria con la interfaz anterior; OpenCV no necesita cierre."""
+        return None
+
+    @staticmethod
+    def _caja_cuadrada(centro, lado: float, ancho: int, alto: int):
+        """Cuadrado centrado en el punto dado, recortado contra los bordes."""
+        cx, cy = float(centro[0]), float(centro[1])
+
+        x1 = int(round(cx - lado / 2))
+        y1 = int(round(cy - lado / 2))
+        x2 = int(round(cx + lado / 2))
+        y2 = int(round(cy + lado / 2))
+
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(ancho, x2), min(alto, y2)
+
+        if x2 - x1 < 8 or y2 - y1 < 8:
+            return None
+
+        return x1, y1, x2 - x1, y2 - y1

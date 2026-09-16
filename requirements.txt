@@ -1,0 +1,21 @@
+# Conjunto de versiones que conviven entre si.
+#
+# El cuello de botella es mediapipe 0.10.x, que exige numpy<2 y
+# protobuf<5. Eso limita TensorFlow a la 2.19, la ultima que acepta esas
+# dos restricciones. Se usa mediapipe 0.10.x y no la 1.0.x porque esta
+# ultima elimino la API mp.solutions.face_mesh y ademas aborta el proceso
+# en macOS al inicializar Metal.
+#
+# Keras no se fija: se deja el que traiga TensorFlow, que es el que mejor
+# se lleva con esa version. Si no lograra leer model_eye.keras, la app
+# recurre sola a modelo_ojos.h5.
+
+tensorflow==2.19.0
+numpy==1.26.4
+protobuf==4.25.9
+mediapipe==0.10.21
+opencv-contrib-python==4.11.0.86
+pillow
+
+# Opcional: si no esta, la alarma usa afplay (incluido en macOS).
+pygame

@@ -1,0 +1,6 @@
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1789562246.356059   39832 gl_context.cc:369] GL version: 2.1 (2.1 Metal - 90.5), renderer: Apple M3
+INFO: Created TensorFlow Lite XNNPACK delegate for CPU.
+W0000 00:00:1789562246.357275   40117 inference_feedback_manager.cc:114] Feedback manager requires a model with a single signature inference. Disabling support for feedback tensors.
+W0000 00:00:1789562246.362169   40117 inference_feedback_manager.cc:114] Feedback manager requires a model with a single signature inference. Disabling support for feedback tensors.
+W0000 00:00:1789562269.307440   40120 landmark_projection_calculator.cc:186] Using NORM_RECT without IMAGE_DIMENSIONS is only supported for the square ROI. Provide IMAGE_DIMENSIONS or use PROJECTION_MATRIX.

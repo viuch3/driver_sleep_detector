@@ -1,0 +1,124 @@
+"""Deteccion de la posicion de los ojos con MediaPipe Face Mesh.
+
+MediaPipe Face Mesh es un modelo preentrenado (Apache 2.0) que devuelve
+478 puntos de referencia de la cara, entre ellos el contorno de cada ojo.
+Con esos puntos se calcula la caja que encierra cada ojo y se recorta la
+region que despues clasifica nuestra CNN.
+
+El modelo viene empaquetado dentro de mediapipe: no hay que descargar
+pesos ni pedir API key.
+"""
+
+import threading
+from dataclasses import dataclass
+
+import cv2
+import mediapipe as mp
+import numpy as np
+
+_mp_face_mesh = mp.solutions.face_mesh
+
+# FACEMESH_LEFT_EYE / RIGHT_EYE son conjuntos de pares (conexiones del
+# contorno). Se aplanan para quedarse solo con los indices de los puntos.
+IDX_OJO_IZQ = sorted({i for conexion in _mp_face_mesh.FACEMESH_LEFT_EYE for i in conexion})
+IDX_OJO_DER = sorted({i for conexion in _mp_face_mesh.FACEMESH_RIGHT_EYE for i in conexion})
+
+# Cuanto se agranda la caja del ojo respecto al contorno detectado.
+# Sirve para que el recorte se parezca a las imagenes de entrenamiento,
+# que traen algo de piel alrededor del ojo. Ajustable.
+MARGEN = 0.40
+
+
+@dataclass
+class Ojo:
+    """Un ojo localizado dentro del frame."""
+
+    lado: str          # "izquierdo" | "derecho" (desde el punto de vista del conductor)
+    x: int             # esquina superior izquierda de la caja, en pixeles del frame
+    y: int
+    w: int
+    h: int
+    recorte: np.ndarray  # sub-imagen BGR correspondiente a la caja
+
+
+class DetectorOjos:
+    """Envoltorio sobre Face Mesh que devuelve cajas y recortes de ojos.
+
+    Face Mesh guarda estado entre frames (hace seguimiento) y no es seguro
+    para uso concurrente, asi que cada llamada se serializa con un lock.
+    FastAPI ejecuta los endpoints sincronos en un pool de hilos, de modo
+    que sin el lock dos peticiones simultaneas corromperian el estado.
+    """
+
+    def __init__(self, max_caras: int = 1, confianza: float = 0.5) -> None:
+        self._mesh = _mp_face_mesh.FaceMesh(
+            static_image_mode=False,      # False = hace seguimiento entre frames
+            max_num_faces=max_caras,
+            refine_landmarks=True,        # anade los puntos del iris
+            min_detection_confidence=confianza,
+            min_tracking_confidence=confianza,
+        )
+        self._lock = threading.Lock()
+
+    def detectar(self, img_bgr: np.ndarray) -> list[Ojo]:
+        """Localiza los ojos en un frame BGR.
+
+        Devuelve una lista vacia si no se detecta ninguna cara (el conductor
+        giro la cabeza, hay poca luz, etc.). Eso no es un error.
+        """
+        alto, ancho = img_bgr.shape[:2]
+
+        # MediaPipe trabaja en RGB; OpenCV entrega BGR.
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+        with self._lock:
+            resultado = self._mesh.process(img_rgb)
+
+        if not resultado.multi_face_landmarks:
+            return []
+
+        puntos = resultado.multi_face_landmarks[0].landmark
+
+        ojos: list[Ojo] = []
+        for lado, indices in (("izquierdo", IDX_OJO_IZQ), ("derecho", IDX_OJO_DER)):
+            caja = self._caja_cuadrada(puntos, indices, ancho, alto)
+            if caja is None:
+                continue
+            x, y, w, h = caja
+            ojos.append(Ojo(lado=lado, x=x, y=y, w=w, h=h, recorte=img_bgr[y:y + h, x:x + w].copy()))
+
+        return ojos
+
+    def cerrar(self) -> None:
+        self._mesh.close()
+
+    @staticmethod
+    def _caja_cuadrada(puntos, indices, ancho: int, alto: int):
+        """Caja cuadrada centrada en el ojo.
+
+        El contorno de un ojo es mucho mas ancho que alto (relacion ~2.5:1).
+        Si se recortara esa caja tal cual y se redimensionara a 64x64, la
+        imagen quedaria aplastada y no se pareceria a las del entrenamiento,
+        que son practicamente cuadradas. Por eso se toma el lado mayor y se
+        construye un cuadrado alrededor del centro del ojo.
+        """
+        xs = [puntos[i].x * ancho for i in indices]
+        ys = [puntos[i].y * alto for i in indices]
+
+        cx = (min(xs) + max(xs)) / 2
+        cy = (min(ys) + max(ys)) / 2
+        lado = max(max(xs) - min(xs), max(ys) - min(ys)) * (1 + MARGEN)
+
+        x1 = int(round(cx - lado / 2))
+        y1 = int(round(cy - lado / 2))
+        x2 = int(round(cx + lado / 2))
+        y2 = int(round(cy + lado / 2))
+
+        # Recortar contra los bordes del frame.
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(ancho, x2), min(alto, y2)
+
+        if x2 - x1 < 8 or y2 - y1 < 8:
+            return None
+
+        return x1, y1, x2 - x1, y2 - y1

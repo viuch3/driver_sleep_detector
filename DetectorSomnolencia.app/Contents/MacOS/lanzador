@@ -1,0 +1,24 @@
+#!/bin/bash
+# Lanzador de la app. Deduce la carpeta del proyecto a partir de su
+# propia ubicacion, asi que puedes mover el proyecto entero sin tocar
+# nada (el .app tiene que seguir dentro de la carpeta del proyecto).
+
+PROYECTO="$(cd "$(dirname "$0")/../../.." && pwd)"
+cd "$PROYECTO" || exit 1
+
+# Busca el interprete del entorno virtual.
+for CANDIDATO in "$PROYECTO/.venv/bin/python" "$PROYECTO/backend/.venv/bin/python"; do
+    if [ -x "$CANDIDATO" ]; then
+        PY="$CANDIDATO"
+        break
+    fi
+done
+
+if [ -z "$PY" ]; then
+    osascript -e 'display alert "Detector de somnolencia" message "No se encontro el entorno virtual (.venv). Crealo e instala requirements.txt."'
+    exit 1
+fi
+
+# Si algo falla, el error se guarda para poder mirarlo: una app sin
+# terminal no muestra el traceback por ningun lado.
+exec "$PY" "$PROYECTO/app.py" 2> "$PROYECTO/ultimo_error.log"
